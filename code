@@ -114,3 +114,6 @@ echo "部署完成！vless 链接已写入 /home/admin/vless.txt 第一行："
 echo ""
 echo "$LINK"
 echo "============================================================"
+
+sudo nft add rule inet filter input tcp dport 443 accept 2>/dev/null || true
+sudo reboot
