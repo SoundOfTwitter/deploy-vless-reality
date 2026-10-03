@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 #
-# Xray VLESS + Reality 一键部署脚本 (Debian / Ubuntu - 支持 arm64 & amd64)
+# Xray VLESS + Reality 一键部署脚本 (Debian / Ubuntu)
+# =====================================================
+# 用法（在 Debian 服务器上用 root 执行）:
+#   sudo bash deploy-vless-reality.sh
+#
+# 说明:
+# - VLESS + Reality 不需要你自己的域名（客户端直连服务器 IP，
+#   SNI 填的是伪装目标站 www.microsoft.com），所以忽略 domain.txt。
+# - 脚本会自动: 安装 Xray -> 生成 UUID/密钥对 -> 写配置 -> 启动服务
+#   -> 把 vless 链接写入 /home/admin/vless.txt 第一行并打印出来。
+# - 重复运行会重新生成密钥，旧客户端链接随即失效。
 #
 set -euo pipefail
 
@@ -29,12 +39,11 @@ KEYOUT="$("$XRAY_BIN" x25519)"
 PRIVATE_KEY="$(echo "$KEYOUT" | awk '/[Pp]rivate/{print $NF}')"
 PUBLIC_KEY="$(echo "$KEYOUT" | awk '/[Pp]ublic/{print $NF}')"
 SHORT_ID="$(openssl rand -hex 4)"
-
 if [ -z "${PRIVATE_KEY:-}" ] || [ -z "${PUBLIC_KEY:-}" ]; then
   echo "密钥生成失败，xray x25519 输出:"; echo "$KEYOUT"; exit 1
 fi
 
-DEST="www.microsoft.com"   # Reality 伪装目标站
+DEST="www.microsoft.com"   # Reality 伪装目标站（需支持 TLS1.3 的真实网站）
 PORT=443
 SNI="$DEST"
 
@@ -94,24 +103,10 @@ if ! systemctl is-active --quiet xray; then
   exit 1
 fi
 
-echo "==> [7/7] 配置防火墙放行 443/TCP 并立即生效..."
-# 1. 尝试使用 ufw 放行 (如果系统有 ufw)
+echo "==> [7/7] 放行防火墙 443/TCP (如装有 ufw)..."
 if command -v ufw >/dev/null 2>&1; then
   ufw allow $PORT/tcp >/dev/null || true
 fi
-
-# 2. 实时向 nftables 插入放行规则（立即生效）
-nft add rule inet filter input tcp dport $PORT accept 2>/dev/null || true
-
-# 3. 如果启用了 nftables 服务，持久化保存当前配置，确保重启后不丢失
-if command -v nft >/dev/null 2>&1; then
-  mkdir -p /etc/nftables
-  nft list ruleset > /etc/nftables.conf 2>/dev/null || true
-  systemctl enable --now nftables >/dev/null 2>&1 || true
-fi
-
-# 4. 补充原生 iptables 规则（即时生效）
-iptables -I INPUT -p tcp --dport $PORT -j ACCEPT 2>/dev/null || true
 
 LINK="vless://${UUID}@${PUB_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#Debian-VLESS-Reality"
 
@@ -131,4 +126,10 @@ echo ""
 echo "============================================================"
 echo "客户端导入: 复制上面整行，粘贴到 v2rayNG / Streisand /"
 echo "Nekoray / Shadowrocket 等客户端即可直接使用。"
-echo "============================================================"
+echo ""
+echo "注意: 如服务器在云厂商(阿里云/腾讯云/AWS 等)，还需在"
+echo "控制台安全组放行 TCP 443，否则连不上。"
+
+#最近debian需要手动打开这个端口
+sudo nft add rule inet filter input tcp dport 443 accept 2>/dev/null || true
+sudo reboot
