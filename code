@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+#
+# Xray VLESS + Reality 一键部署脚本 (Debian / Ubuntu)
+# =====================================================
+# 用法（在 Debian 服务器上用 root 执行）:
+#   sudo bash deploy-vless-reality.sh
+#
+# 说明:
+# - VLESS + Reality 不需要你自己的域名（客户端直连服务器 IP，
+#   SNI 填的是伪装目标站 www.microsoft.com），所以忽略 domain.txt。
+# - 脚本会自动: 安装 Xray -> 生成 UUID/密钥对 -> 写配置 -> 启动服务
+#   -> 把 vless 链接写入 /home/admin/vless.txt 第一行并打印出来。
+# - 重复运行会重新生成密钥，旧客户端链接随即失效。
+#
+set -euo pipefail
+
+echo "==> [1/7] 检查 root 权限..."
+if [ "$(id -u)" -ne 0 ]; then
+  echo "请使用 root 运行: sudo bash $0"
+  exit 1
+fi
+
+echo "==> [2/7] 安装依赖 (curl/openssl)..."
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl openssl ca-certificates >/dev/null
+
+echo "==> [3/7] 安装 / 更新 Xray..."
+bash -c "$(curl -L -s https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+
+XRAY_BIN=/usr/local/bin/xray
+if [ ! -x "$XRAY_BIN" ]; then
+  echo "Xray 安装失败，请检查网络后重试"
+  exit 1
+fi
+
+echo "==> [4/7] 生成 UUID 与 Reality 密钥对..."
+UUID="$(cat /proc/sys/kernel/random/uuid)"
+KEYOUT="$("$XRAY_BIN" x25519)"
+PRIVATE_KEY="$(echo "$KEYOUT" | awk '/[Pp]rivate/{print $NF}')"
+PUBLIC_KEY="$(echo "$KEYOUT" | awk '/[Pp]ublic/{print $NF}')"
+SHORT_ID="$(openssl rand -hex 4)"
+if [ -z "${PRIVATE_KEY:-}" ] || [ -z "${PUBLIC_KEY:-}" ]; then
+  echo "密钥生成失败，xray x25519 输出:"; echo "$KEYOUT"; exit 1
+fi
+
+DEST="www.microsoft.com"   # Reality 伪装目标站（需支持 TLS1.3 的真实网站）
+PORT=443
+SNI="$DEST"
+
+echo "==> [5/7] 获取服务器公网 IPv4..."
+PUB_IP="$(curl -4 -s --max-time 10 https://api.ipify.org || true)"
+[ -z "$PUB_IP" ] && PUB_IP="$(curl -4 -s --max-time 10 https://ifconfig.me || true)"
+if [ -z "$PUB_IP" ]; then
+  echo "无法自动获取公网 IP，请手动填写"
+  exit 1
+fi
+echo "    公网 IP: $PUB_IP"
+
+echo "==> [6/7] 写入 Xray 配置并启动..."
+mkdir -p /usr/local/etc/xray
+cat > /usr/local/etc/xray/config.json <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "port": $PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "$UUID", "flow": "xtls-rprx-vision" }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "$DEST:$PORT",
+          "xver": 0,
+          "serverNames": [ "$SNI" ],
+          "privateKey": "$PRIVATE_KEY",
+          "shortIds": [ "$SHORT_ID" ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
+    }
+  ],
+  "outbounds": [
+    { "protocol": "freedom", "tag": "direct" },
+    { "protocol": "blackhole", "tag": "blocked" }
+  ]
+}
+EOF
+
+systemctl enable --now xray >/dev/null
+sleep 1
+if ! systemctl is-active --quiet xray; then
+  echo "Xray 启动失败，查看日志: journalctl -u xray --no-pager | tail -30"
+  exit 1
+fi
+
+echo "==> [7/7] 放行防火墙 443/TCP (如装有 ufw)..."
+if command -v ufw >/dev/null 2>&1; then
+  ufw allow $PORT/tcp >/dev/null || true
+fi
+
+LINK="vless://${UUID}@${PUB_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#Debian-VLESS-Reality"
+
+mkdir -p /home/admin
+printf '%s\n' "$LINK" > /home/admin/vless.txt
+if id admin >/dev/null 2>&1; then
+  chown admin:admin /home/admin/vless.txt
+fi
+chmod 600 /home/admin/vless.txt
+
+echo ""
+echo "============================================================"
+echo "部署完成！vless 链接已写入 /home/admin/vless.txt 第一行："
+echo ""
+echo "$LINK"
+echo ""
+echo "============================================================"
+echo "客户端导入: 复制上面整行，粘贴到 v2rayNG / Streisand /"
+echo "Nekoray / Shadowrocket 等客户端即可直接使用。"
+echo ""
+echo "注意: 如服务器在云厂商(阿里云/腾讯云/AWS 等)，还需在"
+echo "控制台安全组放行 TCP 443，否则连不上。"
+
+sudo nft add rule inet filter input tcp dport 443 accept 2>/dev/null || true
+sudo reboot
